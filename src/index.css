@@ -1,0 +1,21 @@
+@import url('https://fonts.googleapis.com/css2?family=Dancing+Script:wght@600;700&family=Inter:wght@400;500;600&family=Space+Grotesk:wght@500;600;700&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
+}
+
+/* Make all clickable elements have a pointer cursor */
+button,
+a,
+select,
+option,
+input[type="button"],
+input[type="submit"],
+[role="button"],
+.cursor-pointer {
+  cursor: pointer !important;
+}
+
+

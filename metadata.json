@@ -1,0 +1,6 @@
+{
+  "name": "Poster Gallery & Studio",
+  "description": "Browse and order posters synced directly from Google Drive and save orders to Google Sheets.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
