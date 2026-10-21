@@ -1,4 +1,16 @@
-import { PDFDocument, PDFImage, PDFPage, rgb } from 'pdf-lib';
+import {
+  PDFDocument,
+  PDFImage,
+  PDFPage,
+  rgb,
+  pushGraphicsState,
+  popGraphicsState,
+  moveTo,
+  lineTo,
+  closePath,
+  clip,
+  endPath,
+} from 'pdf-lib';
 import JSZip from 'jszip';
 import { DriveFile } from './api';
 
@@ -323,7 +335,10 @@ async function renderPdf(sheets: SheetPlan[], imageCache: Map<string, CachedImag
 
       const effectiveW = needsRotate ? cached.naturalH : cached.naturalW;
       const effectiveH = needsRotate ? cached.naturalW : cached.naturalH;
-      const scale = Math.min(placement.w / effectiveW, placement.h / effectiveH);
+      // Fill the whole frame regardless of the image's own aspect ratio —
+      // scale by the larger ratio so both dimensions cover the frame, then
+      // clip to the frame so whatever overflows is cropped away, not shown.
+      const scale = Math.max(placement.w / effectiveW, placement.h / effectiveH);
       const drawWIn = effectiveW * scale;
       const drawHIn = effectiveH * scale;
 
@@ -333,12 +348,30 @@ async function renderPdf(sheets: SheetPlan[], imageCache: Map<string, CachedImag
       const drawYFromTopIn = frameYFromTopIn + (placement.h - drawHIn) / 2;
       const drawYFromBottomIn = SHEET_H_IN - drawYFromTopIn - drawHIn;
 
+      const frameXPt = frameXIn * PT_PER_IN;
+      const frameYFromBottomPt = (SHEET_H_IN - frameYFromTopIn - placement.h) * PT_PER_IN;
+      const frameWPt = placement.w * PT_PER_IN;
+      const frameHPt = placement.h * PT_PER_IN;
+
+      page.pushOperators(
+        pushGraphicsState(),
+        moveTo(frameXPt, frameYFromBottomPt),
+        lineTo(frameXPt + frameWPt, frameYFromBottomPt),
+        lineTo(frameXPt + frameWPt, frameYFromBottomPt + frameHPt),
+        lineTo(frameXPt, frameYFromBottomPt + frameHPt),
+        closePath(),
+        clip(),
+        endPath(),
+      );
+
       page.drawImage(img, {
         x: drawXIn * PT_PER_IN,
         y: drawYFromBottomIn * PT_PER_IN,
         width: drawWIn * PT_PER_IN,
         height: drawHIn * PT_PER_IN,
       });
+
+      page.pushOperators(popGraphicsState());
     }
 
     if (cropMarks) {
