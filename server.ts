@@ -1,6 +1,7 @@
 import dotenv from "dotenv";
 import express from "express";
 import path from "path";
+import fs from "fs";
 import { createServer as createViteServer } from "vite";
 import { google } from "googleapis";
 import multer from "multer";
@@ -9,6 +10,37 @@ import { Readable } from "stream";
 dotenv.config({ path: ".env.local" });
 
 const upload = multer();
+
+const OAUTH_SCOPES = ["https://www.googleapis.com/auth/drive"];
+
+function getOAuthClient() {
+  const clientId = process.env.GOOGLE_OAUTH_CLIENT_ID;
+  const clientSecret = process.env.GOOGLE_OAUTH_CLIENT_SECRET;
+  const redirectUri = process.env.GOOGLE_OAUTH_REDIRECT_URI;
+
+  if (!clientId || !clientSecret || !redirectUri) {
+    throw new Error("Missing GOOGLE_OAUTH_CLIENT_ID/SECRET/REDIRECT_URI in .env.local");
+  }
+
+  const client = new google.auth.OAuth2(clientId, clientSecret, redirectUri);
+  if (process.env.GOOGLE_OAUTH_REFRESH_TOKEN) {
+    client.setCredentials({ refresh_token: process.env.GOOGLE_OAUTH_REFRESH_TOKEN });
+  }
+  return client;
+}
+
+// Persists the refresh token to .env.local so it survives server restarts —
+// this is a single-user local app, so a file write is simpler than a DB.
+function persistRefreshToken(token: string) {
+  const envPath = ".env.local";
+  const existing = fs.readFileSync(envPath, "utf-8");
+  const line = `GOOGLE_OAUTH_REFRESH_TOKEN=${token}`;
+  const updated = /^GOOGLE_OAUTH_REFRESH_TOKEN=.*$/m.test(existing)
+    ? existing.replace(/^GOOGLE_OAUTH_REFRESH_TOKEN=.*$/m, line)
+    : `${existing.trimEnd()}\n${line}\n`;
+  fs.writeFileSync(envPath, updated);
+  process.env.GOOGLE_OAUTH_REFRESH_TOKEN = token;
+}
 
 async function startServer() {
   const app = express();
@@ -248,6 +280,73 @@ async function startServer() {
       res.json(response.data);
     } catch (error: any) {
       console.error('Sheets Get Error:', error);
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // --- OAUTH (for Drive writes — the service account has no storage quota) ---
+  app.get("/api/oauth/status", (req, res) => {
+    res.json({ connected: Boolean(process.env.GOOGLE_OAUTH_REFRESH_TOKEN) });
+  });
+
+  app.get("/api/oauth/connect", (req, res) => {
+    try {
+      const client = getOAuthClient();
+      const url = client.generateAuthUrl({
+        access_type: "offline",
+        prompt: "consent",
+        scope: OAUTH_SCOPES,
+      });
+      res.redirect(url);
+    } catch (error: any) {
+      res.status(500).send(error.message);
+    }
+  });
+
+  app.get("/api/oauth/callback", async (req, res) => {
+    try {
+      const code = req.query.code as string;
+      if (!code) throw new Error("Missing code in OAuth callback");
+      const client = getOAuthClient();
+      const { tokens } = await client.getToken(code);
+      if (!tokens.refresh_token) {
+        throw new Error("No refresh token returned — revoke the app's access at https://myaccount.google.com/permissions and try again (Google only issues a refresh token on first consent).");
+      }
+      persistRefreshToken(tokens.refresh_token);
+      res.send("<h2>Google Drive connected.</h2><p>You can close this tab.</p>");
+    } catch (error: any) {
+      console.error("OAuth Callback Error:", error);
+      res.status(500).send(`OAuth failed: ${error.message}`);
+    }
+  });
+
+  app.post("/api/drive/upload-as-user", upload.single("file"), async (req, res) => {
+    try {
+      if (!process.env.GOOGLE_OAUTH_REFRESH_TOKEN) {
+        throw new Error("Google Drive isn't connected yet — visit /api/oauth/connect once to authorize.");
+      }
+      const auth = getOAuthClient();
+      const drive = google.drive({ version: "v3", auth });
+
+      const metadata = JSON.parse(req.body.metadata);
+      const file = req.file;
+      if (!file) throw new Error("No file uploaded");
+
+      const response = await drive.files.create({
+        requestBody: {
+          name: metadata.name,
+          parents: metadata.parents,
+        },
+        media: {
+          mimeType: file.mimetype,
+          body: Readable.from(file.buffer),
+        },
+        fields: "id,name,webViewLink",
+      });
+
+      res.json(response.data);
+    } catch (error: any) {
+      console.error("Drive Upload (OAuth) Error:", error);
       res.status(500).json({ error: error.message });
     }
   });

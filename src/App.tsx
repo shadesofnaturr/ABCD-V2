@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { buildOrderPdfZip, PRINT_SIZE_KEYS } from './lib/pdf';
 import { ShoppingCart, CheckCircle, ChevronLeft, ChevronRight, Image as ImageIcon, Folder, Loader2, ArrowRight, Edit2, Trash2, X, Search, Menu, User as UserIcon, Bell, Phone, Mail, Instagram, ShoppingBag, Heart, LayoutGrid, List, Sparkles, Car, Smile, Compass, Film, Zap, BookOpen, Music, Trophy, Star } from 'lucide-react';
-import { getRootFolders, getFoldersInFolder, getImagesInFolder, getOrCreateOrdersSheet, appendOrderRow, appendCustomOrderRow, createDriveFolder, getOrCreateMainOrdersFolder, getOrCreateMainCatalogsFolder, getOrCreateMainCustomOrdersFolder, getOrCreateCustomOrdersSheet, updateDriveFolder, deleteDriveFolder, uploadImageToFolder, updateDriveFile, copyDriveFile, DriveFolder, DriveFile, getOrCreateUsersSheet, appendUserRow, updateUserRow, fetchAllUsers, fetchUserOrdersFromSheet, SheetOrder } from './lib/api';
+import { getRootFolders, getFoldersInFolder, getImagesInFolder, getOrCreateOrdersSheet, appendOrderRow, appendCustomOrderRow, createDriveFolder, getOrCreateMainOrdersFolder, getOrCreateMainCatalogsFolder, getOrCreateMainCustomOrdersFolder, getOrCreateCustomOrdersSheet, updateDriveFolder, deleteDriveFolder, uploadImageToFolder, updateDriveFile, copyDriveFile, DriveFolder, DriveFile, getOrCreateUsersSheet, appendUserRow, updateUserRow, fetchAllUsers, fetchUserOrdersFromSheet, SheetOrder, getOrCreateOrdersUploadFolder, uploadOrderZip } from './lib/api';
 import { cn } from './lib/utils';
 
 const SECURITY_QUESTIONS = [
@@ -796,7 +796,7 @@ const getCategoryIcon = (categoryName: string) => {
     setIsSubmitting(true);
     try {
       const dateStr = new Date().toLocaleString();
-      
+
       if (cartLines.length > 0) {
         const sheetId = await getOrCreateOrdersSheet();
         const posterNames = cartLines.map(l => {
@@ -806,15 +806,7 @@ const getCategoryIcon = (categoryName: string) => {
         }).join(', ');
         const totalQuantity = cartLines.reduce((sum, l) => sum + l.quantity, 0);
 
-        await appendOrderRow(sheetId, [
-          dateStr,
-          customerName,
-          customerPhone,
-          posterNames,
-          totalQuantity.toString(),
-          clientEmail.trim().toLowerCase()
-        ]);
-
+        let zipLink = '';
         const printLines = cartLines.filter(l => l.poster.categoryHint !== 'Stickers');
         if (printLines.length > 0) {
           setIsGeneratingPdf(true);
@@ -822,18 +814,25 @@ const getCategoryIcon = (categoryName: string) => {
             const safeFilePart = (s: string) => s.replace(/[\\/:*?"<>|]/g, '-').trim();
             const zipFilename = `${safeFilePart(customerName) || 'Order'} - ${safeFilePart(dateStr)}.zip`;
             const blob = await buildOrderPdfZip(printLines);
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = zipFilename;
-            a.click();
-            URL.revokeObjectURL(url);
+            const folderId = await getOrCreateOrdersUploadFolder();
+            const uploaded = await uploadOrderZip(folderId, blob, zipFilename);
+            zipLink = uploaded.webViewLink || '';
           } catch (err) {
-            console.error('Order PDF generation failed:', err);
+            console.error('Order PDF generation/upload failed:', err);
           } finally {
             setIsGeneratingPdf(false);
           }
         }
+
+        await appendOrderRow(sheetId, [
+          dateStr,
+          customerName,
+          customerPhone,
+          posterNames,
+          totalQuantity.toString(),
+          clientEmail.trim().toLowerCase(),
+          zipLink
+        ]);
       }
 
       setSubmitSuccess(true);

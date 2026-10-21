@@ -160,11 +160,44 @@ export async function uploadImageToFolder(folderId: string, file: File): Promise
   return res.json();
 }
 
+// The service account has zero Drive storage quota, so order-zip uploads go
+// through the OAuth-authorized owner account instead (one-time admin login,
+// see /api/oauth/connect) — this route runs as that real account.
+export async function uploadOrderZip(folderId: string, blob: Blob, filename: string): Promise<{ id: string; webViewLink: string }> {
+  const metadata = { name: filename, parents: [folderId] };
+  const form = new FormData();
+  form.append('metadata', JSON.stringify(metadata));
+  form.append('file', blob, filename);
+
+  const res = await fetch(`${API_BASE}/drive/upload-as-user`, {
+    method: 'POST',
+    body: form
+  });
+
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => null);
+    throw new Error(errorData?.error || 'Zip upload failed');
+  }
+  return res.json();
+}
+
+export async function getOrCreateOrdersUploadFolder(): Promise<string> {
+  const q = `name='Orders' and mimeType='application/vnd.google-apps.folder' and trashed=false`;
+  const data = await fetchAPI(`${API_BASE}/drive/files?method=list&q=${encodeURIComponent(q)}&fields=${encodeURIComponent('files(id,name)')}`);
+  const files = data.files || [];
+  if (files.length > 0) return files[0].id;
+  throw new Error("No Drive folder named 'Orders' found — create one and share it with the connected account.");
+}
+
 export async function getOrCreateOrdersSheet(): Promise<string> {
   const q = `name='Poster Orders' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false`;
   const data = await fetchAPI(`${API_BASE}/drive/files?method=list&q=${encodeURIComponent(q)}&fields=${encodeURIComponent('files(id,name)')}`);
   const files = data.files || [];
-  if (files.length > 0) return files[0].id;
+  if (files.length > 0) {
+    const sheetId = files[0].id;
+    await ensureOrdersSheetHasZipLinkColumn(sheetId);
+    return sheetId;
+  }
 
   const createRes = await fetchAPI(`${API_BASE}/sheets`, {
     method: 'POST',
@@ -174,14 +207,32 @@ export async function getOrCreateOrdersSheet(): Promise<string> {
       sheets: [{ properties: { title: 'Orders' } }]
     })
   });
-  
+
   const sheetId = createRes.spreadsheetId;
-  await appendOrderRow(sheetId, ['Date', 'Customer Name', 'Phone Number', 'Selected Posters', 'Poster Count', 'User Email']);
+  await appendOrderRow(sheetId, ['Date', 'Customer Name', 'Phone Number', 'Selected Posters', 'Poster Count', 'User Email', 'Zip Link']);
   return sheetId;
 }
 
+// Older sheets were created before the 'Zip Link' column existed — backfill
+// the header once so existing spreadsheets pick it up without manual edits.
+async function ensureOrdersSheetHasZipLinkColumn(sheetId: string): Promise<void> {
+  try {
+    const data = await fetchAPI(`${API_BASE}/sheets/${sheetId}/values/Orders!G1`);
+    const hasHeader = (data.values?.[0]?.[0] || '').trim().length > 0;
+    if (!hasHeader) {
+      await fetchAPI(`${API_BASE}/sheets/${sheetId}/values/Orders!G1`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ values: [['Zip Link']] })
+      });
+    }
+  } catch (err) {
+    console.warn('Could not verify/backfill Zip Link column:', err);
+  }
+}
+
 export async function appendOrderRow(sheetId: string, rowData: string[]) {
-  const range = 'Orders!A:F';
+  const range = 'Orders!A:G';
   const url = `${API_BASE}/sheets/${sheetId}/values/${range}`;
   await fetchAPI(url, {
     method: 'POST',
@@ -197,15 +248,16 @@ export interface SheetOrder {
   posters: string;
   count: string;
   email: string;
+  zipLink: string;
 }
 
 export async function fetchUserOrdersFromSheet(email: string, phone: string): Promise<SheetOrder[]> {
   try {
     const sheetId = await getOrCreateOrdersSheet();
-    const range = 'Orders!A:F';
+    const range = 'Orders!A:G';
     const data = await fetchAPI(`${API_BASE}/sheets/${sheetId}/values/${range}`);
     const rows = data.values || [];
-    
+
     // Skip header row
     const orders: SheetOrder[] = rows.slice(1).map((row: any[]) => ({
       date: row[0] || '',
@@ -213,7 +265,8 @@ export async function fetchUserOrdersFromSheet(email: string, phone: string): Pr
       phone: row[2] || '',
       posters: row[3] || '',
       count: row[4] || '',
-      email: row[5] || ''
+      email: row[5] || '',
+      zipLink: row[6] || ''
     }));
     
     return orders.filter(o => {
