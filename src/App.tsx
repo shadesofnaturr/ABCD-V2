@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { buildOrderPDF, PRINT_SIZE_KEYS } from './lib/pdf';
+import { buildOrderPdfZip, PRINT_SIZE_KEYS } from './lib/pdf';
 import { ShoppingCart, CheckCircle, ChevronLeft, ChevronRight, Image as ImageIcon, Folder, Loader2, ArrowRight, Edit2, Trash2, X, Search, Menu, User as UserIcon, Bell, Phone, Mail, Instagram, ShoppingBag, Heart, LayoutGrid, List, Sparkles, Car, Smile, Compass, Film, Zap, BookOpen, Music, Trophy, Star } from 'lucide-react';
 import { getRootFolders, getFoldersInFolder, getImagesInFolder, getOrCreateOrdersSheet, appendOrderRow, appendCustomOrderRow, createDriveFolder, getOrCreateMainOrdersFolder, getOrCreateMainCatalogsFolder, getOrCreateMainCustomOrdersFolder, getOrCreateCustomOrdersSheet, updateDriveFolder, deleteDriveFolder, uploadImageToFolder, updateDriveFile, copyDriveFile, DriveFolder, DriveFile, getOrCreateUsersSheet, appendUserRow, updateUserRow, fetchAllUsers, fetchUserOrdersFromSheet, SheetOrder } from './lib/api';
 import { cn } from './lib/utils';
@@ -820,12 +820,12 @@ const getCategoryIcon = (categoryName: string) => {
           setIsGeneratingPdf(true);
           try {
             const safeFilePart = (s: string) => s.replace(/[\\/:*?"<>|]/g, '-').trim();
-            const pdfFilename = `${safeFilePart(customerName) || 'Order'} - ${safeFilePart(dateStr)}.pdf`;
-            const blob = await buildOrderPDF(printLines);
+            const zipFilename = `${safeFilePart(customerName) || 'Order'} - ${safeFilePart(dateStr)}.zip`;
+            const blob = await buildOrderPdfZip(printLines);
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
-            a.download = pdfFilename;
+            a.download = zipFilename;
             a.click();
             URL.revokeObjectURL(url);
           } catch (err) {
@@ -1606,7 +1606,7 @@ const getCategoryIcon = (categoryName: string) => {
             <Loader2 className="w-10 h-10 text-black animate-spin mb-8" />
             <h2 className="text-xl font-light tracking-[0.2em] uppercase mb-4 text-[#1A1A1A]">Preparing Your Order</h2>
             <p className="text-[11px] text-[#999] uppercase tracking-wider max-w-md mx-auto leading-relaxed font-bold text-center">
-              Generating your print-ready PDF. This will just take a moment.
+              Generating a print-ready PDF for each size and zipping them up. This will just take a moment.
             </p>
           </div>
         ) : /* SUCCESS VIEW */

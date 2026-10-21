@@ -1,4 +1,5 @@
 import { PDFDocument, PDFImage } from 'pdf-lib';
+import JSZip from 'jszip';
 import { DriveFile } from './api';
 
 // --- Print sizes, in inches (matches the print-shop layout spec exactly) ---
@@ -10,7 +11,7 @@ interface PrintSizeDef {
 
 const PRINT_SIZES: Record<string, PrintSizeDef> = {
   A4: { key: 'A4', widthIn: 8.27, heightIn: 11.69 },
-  A5: { key: 'A5', widthIn: 6, heightIn: 8 },
+  A5: { key: 'A5', widthIn: 6, heightIn: 8.2 },
   'A4 Oversize': { key: 'A4 Oversize', widthIn: 9, heightIn: 12.5 },
   A3: { key: 'A3', widthIn: 12.5, heightIn: 18.5 },
 };
@@ -33,12 +34,10 @@ const EPS_IN = 0.001;
 interface Orientation {
   w: number;
   h: number;
-  rotated: boolean;
 }
 
 interface PrintJob {
   poster: DriveFile;
-  sizeKey: string;
 }
 
 interface Placement {
@@ -55,8 +54,8 @@ interface SheetPlan {
 
 function orientationsOf(size: PrintSizeDef): Orientation[] {
   return [
-    { w: size.widthIn, h: size.heightIn, rotated: false },
-    { w: size.heightIn, h: size.widthIn, rotated: true },
+    { w: size.widthIn, h: size.heightIn },
+    { w: size.heightIn, h: size.widthIn },
   ];
 }
 
@@ -67,136 +66,46 @@ function gridCapacity(w: number, h: number): number {
   return cols * rows;
 }
 
-function bestOrientation(size: PrintSizeDef): { orientation: Orientation; capacity: number } {
-  const orientations = orientationsOf(size);
-  let best = { orientation: orientations[0], capacity: gridCapacity(orientations[0].w, orientations[0].h) };
-  for (let i = 1; i < orientations.length; i++) {
-    const capacity = gridCapacity(orientations[i].w, orientations[i].h);
-    if (capacity > best.capacity) {
-      best = { orientation: orientations[i], capacity };
-    }
-  }
-  return best;
-}
-
-// Phase A: tile same-size jobs into dedicated full grids; whatever doesn't
-// complete a grid is returned as a remainder for Phase B.
-function packDedicatedGrids(jobsBySize: Map<string, PrintJob[]>): { sheets: SheetPlan[]; remainders: PrintJob[] } {
-  const sheets: SheetPlan[] = [];
-  const remainders: PrintJob[] = [];
-
-  for (const [sizeKey, jobs] of jobsBySize) {
-    const sizeDef = PRINT_SIZES[sizeKey];
-    const { orientation, capacity } = bestOrientation(sizeDef);
-    if (capacity === 0) {
-      // Doesn't fit the sheet at all, even alone. Shouldn't happen for the supported sizes.
-      remainders.push(...jobs);
-      continue;
-    }
+function bestOrientation(size: PrintSizeDef): { orientation: Orientation; cols: number; rows: number; capacity: number } {
+  let best: { orientation: Orientation; cols: number; rows: number; capacity: number } | null = null;
+  for (const orientation of orientationsOf(size)) {
     const cols = Math.floor((USABLE_W_IN + GAP_IN) / (orientation.w + GAP_IN) + EPS_IN);
     const rows = Math.floor((USABLE_H_IN + GAP_IN) / (orientation.h + GAP_IN) + EPS_IN);
-
-    let idx = 0;
-    while (jobs.length - idx >= capacity) {
-      const placements: Placement[] = [];
-      for (let r = 0; r < rows; r++) {
-        for (let c = 0; c < cols; c++) {
-          placements.push({
-            poster: jobs[idx++].poster,
-            x: c * (orientation.w + GAP_IN),
-            y: r * (orientation.h + GAP_IN),
-            w: orientation.w,
-            h: orientation.h,
-          });
-        }
-      }
-      sheets.push({ placements });
-    }
-    for (; idx < jobs.length; idx++) {
-      remainders.push(jobs[idx]);
+    const capacity = gridCapacity(orientation.w, orientation.h);
+    if (!best || capacity > best.capacity) {
+      best = { orientation, cols, rows, capacity };
     }
   }
-
-  return { sheets, remainders };
+  return best!;
 }
 
-interface Shelf {
-  y: number;
-  height: number;
-  usedWidth: number;
-}
-
-interface MixedSheet {
-  placements: Placement[];
-  shelves: Shelf[];
-  usedHeight: number;
-}
-
-// Phase B: shelf-pack leftovers of possibly-different sizes onto shared sheets.
-function packRemainders(remainders: PrintJob[], preferredOrientation: Map<string, Orientation>): SheetPlan[] {
-  const sorted = [...remainders].sort((a, b) => {
-    const sa = PRINT_SIZES[a.sizeKey];
-    const sb = PRINT_SIZES[b.sizeKey];
-    return sb.widthIn * sb.heightIn - sa.widthIn * sa.heightIn;
-  });
-
-  const sheets: MixedSheet[] = [];
-
-  for (const job of sorted) {
-    const sizeDef = PRINT_SIZES[job.sizeKey];
-    const preferred = preferredOrientation.get(job.sizeKey);
-    const candidates = preferred
-      ? [preferred, ...orientationsOf(sizeDef).filter(o => o.rotated !== preferred.rotated)]
-      : orientationsOf(sizeDef);
-
-    let placed = false;
-
-    // Try to slot into an existing shelf on an existing sheet.
-    for (const sheet of sheets) {
-      for (const orientation of candidates) {
-        for (const shelf of sheet.shelves) {
-          const needed = shelf.usedWidth === 0 ? orientation.w : shelf.usedWidth + GAP_IN + orientation.w;
-          if (orientation.h <= shelf.height + EPS_IN && needed <= USABLE_W_IN + EPS_IN) {
-            const x = shelf.usedWidth === 0 ? 0 : shelf.usedWidth + GAP_IN;
-            sheet.placements.push({ poster: job.poster, x, y: shelf.y, w: orientation.w, h: orientation.h });
-            shelf.usedWidth = needed;
-            placed = true;
-            break;
-          }
-        }
-        if (placed) break;
-      }
-      if (placed) break;
-    }
-    if (placed) continue;
-
-    // Try starting a new shelf below the last one on an existing sheet.
-    for (const sheet of sheets) {
-      for (const orientation of candidates) {
-        const y = sheet.usedHeight === 0 ? 0 : sheet.usedHeight + GAP_IN;
-        if (orientation.w <= USABLE_W_IN + EPS_IN && y + orientation.h <= USABLE_H_IN + EPS_IN) {
-          sheet.shelves.push({ y, height: orientation.h, usedWidth: orientation.w });
-          sheet.placements.push({ poster: job.poster, x: 0, y, w: orientation.w, h: orientation.h });
-          sheet.usedHeight = y + orientation.h;
-          placed = true;
-          break;
-        }
-      }
-      if (placed) break;
-    }
-    if (placed) continue;
-
-    // New sheet.
-    const orientation = candidates[0];
-    const sheet: MixedSheet = {
-      placements: [{ poster: job.poster, x: 0, y: 0, w: orientation.w, h: orientation.h }],
-      shelves: [{ y: 0, height: orientation.h, usedWidth: orientation.w }],
-      usedHeight: orientation.h,
-    };
-    sheets.push(sheet);
+// Every size gets its own dedicated PDF, so there's no cross-size mixing to
+// solve — just tile same-size jobs into a grid, one sheet at a time, letting
+// the final sheet end up partially filled if the count doesn't divide evenly.
+function packSingleSize(jobs: PrintJob[], sizeKey: string): SheetPlan[] {
+  const sizeDef = PRINT_SIZES[sizeKey];
+  const { orientation, cols, rows, capacity } = bestOrientation(sizeDef);
+  if (capacity === 0) {
+    throw new Error(`Size "${sizeKey}" (${sizeDef.widthIn}x${sizeDef.heightIn}in) doesn't fit the ${SHEET_W_IN}x${SHEET_H_IN}in sheet at all.`);
   }
 
-  return sheets.map(s => ({ placements: s.placements }));
+  const sheets: SheetPlan[] = [];
+  for (let start = 0; start < jobs.length; start += capacity) {
+    const batch = jobs.slice(start, start + capacity);
+    const placements: Placement[] = batch.map((job, i) => {
+      const r = Math.floor(i / cols);
+      const c = i % cols;
+      return {
+        poster: job.poster,
+        x: c * (orientation.w + GAP_IN),
+        y: r * (orientation.h + GAP_IN),
+        w: orientation.w,
+        h: orientation.h,
+      };
+    });
+    sheets.push({ placements });
+  }
+  return sheets;
 }
 
 // The /api/drive/files/:id/download proxy doesn't reliably forward Content-Type,
@@ -248,45 +157,9 @@ interface CachedImage {
   naturalH: number;
 }
 
-export interface OrderLine {
-  poster: DriveFile;
-  size: string;
-  quantity: number;
-}
-
-export async function buildOrderPDF(lines: OrderLine[]): Promise<Blob> {
-  // 1. Flatten the cart into individual print jobs, grouped by size.
-  const jobsBySize = new Map<string, PrintJob[]>();
-  for (const line of lines) {
-    const sizeKey = PRINT_SIZES[line.size] ? line.size : PRINT_SIZE_KEYS[0];
-    if (line.quantity <= 0) continue;
-    const list = jobsBySize.get(sizeKey) || [];
-    for (let i = 0; i < line.quantity; i++) list.push({ poster: line.poster, sizeKey });
-    jobsBySize.set(sizeKey, list);
-  }
-  if (jobsBySize.size === 0) {
-    throw new Error('No posters to lay out into a PDF');
-  }
-
-  // 2. Phase A: dedicated same-size grids, Phase B: shared remainder sheets.
-  const preferredOrientation = new Map<string, Orientation>();
-  for (const sizeKey of jobsBySize.keys()) {
-    preferredOrientation.set(sizeKey, bestOrientation(PRINT_SIZES[sizeKey]).orientation);
-  }
-  const { sheets: gridSheets, remainders } = packDedicatedGrids(jobsBySize);
-  const mixedSheets = remainders.length > 0 ? packRemainders(remainders, preferredOrientation) : [];
-  const allSheets = [...gridSheets, ...mixedSheets];
-
-  // 3. Fetch each unique poster image once, in parallel.
-  const uniquePosters = new Map<string, DriveFile>();
-  for (const sheet of allSheets) {
-    for (const placement of sheet.placements) {
-      uniquePosters.set(placement.poster.id, placement.poster);
-    }
-  }
-
+async function fetchImageCache(posters: DriveFile[]): Promise<Map<string, CachedImage>> {
   const imageCache = new Map<string, CachedImage>();
-  await Promise.all(Array.from(uniquePosters.values()).map(async (poster) => {
+  await Promise.all(posters.map(async (poster) => {
     try {
       const response = await fetch(`/api/drive/files/${poster.id}/download`);
       if (!response.ok) {
@@ -300,8 +173,11 @@ export async function buildOrderPDF(lines: OrderLine[]): Promise<Blob> {
       console.error('Error downloading poster for PDF:', poster.name, err);
     }
   }));
+  return imageCache;
+}
 
-  // 4. Build the PDF, embedding each (poster, rotated) variant at most once.
+// Builds one PDF (all sheets for a single size) from a pre-fetched image cache.
+async function renderPdf(sheets: SheetPlan[], imageCache: Map<string, CachedImage>): Promise<Blob> {
   const pdf = await PDFDocument.create();
   const embedCache = new Map<string, PDFImage>();
 
@@ -326,7 +202,7 @@ export async function buildOrderPDF(lines: OrderLine[]): Promise<Blob> {
     return img;
   }
 
-  for (const sheet of allSheets) {
+  for (const sheet of sheets) {
     const page = pdf.addPage([SHEET_W_IN * PT_PER_IN, SHEET_H_IN * PT_PER_IN]);
 
     for (const placement of sheet.placements) {
@@ -363,4 +239,50 @@ export async function buildOrderPDF(lines: OrderLine[]): Promise<Blob> {
 
   const pdfBytes = await pdf.save();
   return new Blob([pdfBytes], { type: 'application/pdf' });
+}
+
+export interface OrderLine {
+  poster: DriveFile;
+  size: string;
+  quantity: number;
+}
+
+// Builds one PDF per distinct size present in the order (all A4 together, all
+// A5 together, etc.) and bundles them into a single downloadable zip.
+export async function buildOrderPdfZip(lines: OrderLine[]): Promise<Blob> {
+  const jobsBySize = new Map<string, PrintJob[]>();
+  for (const line of lines) {
+    const sizeKey = PRINT_SIZES[line.size] ? line.size : PRINT_SIZE_KEYS[0];
+    if (line.quantity <= 0) continue;
+    const list = jobsBySize.get(sizeKey) || [];
+    for (let i = 0; i < line.quantity; i++) list.push({ poster: line.poster });
+    jobsBySize.set(sizeKey, list);
+  }
+  if (jobsBySize.size === 0) {
+    throw new Error('No posters to lay out into a PDF');
+  }
+
+  const sheetsBySize = new Map<string, SheetPlan[]>();
+  const uniquePosters = new Map<string, DriveFile>();
+  for (const [sizeKey, jobs] of jobsBySize) {
+    const sheets = packSingleSize(jobs, sizeKey);
+    sheetsBySize.set(sizeKey, sheets);
+    for (const sheet of sheets) {
+      for (const placement of sheet.placements) {
+        uniquePosters.set(placement.poster.id, placement.poster);
+      }
+    }
+  }
+
+  // Fetch every unique poster image once, shared across all the per-size PDFs.
+  const imageCache = await fetchImageCache(Array.from(uniquePosters.values()));
+
+  const zip = new JSZip();
+  for (const [sizeKey, sheets] of sheetsBySize) {
+    const blob = await renderPdf(sheets, imageCache);
+    const safeName = sizeKey.replace(/[\\/:*?"<>|]/g, '-');
+    zip.file(`${safeName}.pdf`, blob);
+  }
+
+  return zip.generateAsync({ type: 'blob' });
 }
