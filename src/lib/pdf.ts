@@ -1,4 +1,4 @@
-import { PDFDocument, PDFImage } from 'pdf-lib';
+import { PDFDocument, PDFImage, PDFPage, rgb } from 'pdf-lib';
 import JSZip from 'jszip';
 import { DriveFile } from './api';
 
@@ -30,6 +30,16 @@ const MARGIN_IN = 0.25;
 const USABLE_W_IN = SHEET_W_IN - MARGIN_IN;
 const USABLE_H_IN = SHEET_H_IN - MARGIN_IN;
 const EPS_IN = 0.001;
+
+// Crop/trim marks are only drawn for these sizes, matching the reference layouts.
+const CROP_MARK_SIZES = new Set(['A4', 'A5']);
+const CROP_MARK_HALF_LEN_IN = 0.25;
+const CROP_MARK_COLOR = rgb(0.45, 0.45, 0.45);
+const CROP_MARK_THICKNESS = 1.5;
+// Minimum clear gap between a crop mark and the nearest poster edge. Only
+// applied on the generous-margin side (where there's room for it) — the
+// tight 0.25in margins on the other sides can't fit a mark plus this gap.
+const CROP_MARK_CLEARANCE_IN = 0.25;
 
 interface Orientation {
   w: number;
@@ -108,6 +118,99 @@ function packSingleSize(jobs: PrintJob[], sizeKey: string): SheetPlan[] {
   return sheets;
 }
 
+// Draws crop/trim marks for an evenly-spaced cols x rows grid: a "+" crosshair
+// wherever four cells meet internally, and a short tick wherever a single
+// internal divider meets the outer edge of the grid. Purely a visual overlay
+// in the margin/gap space — doesn't touch the placement geometry at all.
+function drawCropMarks(page: PDFPage, cols: number, rows: number, cellW: number, cellH: number) {
+  const colBoundaryXIn = (b: number): number => {
+    if (b === 0) return MARGIN_IN;
+    if (b === cols) return MARGIN_IN + cols * cellW + (cols - 1) * GAP_IN;
+    return MARGIN_IN + b * cellW + (b - 0.5) * GAP_IN;
+  };
+  const rowBoundaryYFromTopIn = (b: number): number => {
+    if (b === 0) return MARGIN_IN;
+    if (b === rows) return MARGIN_IN + rows * cellH + (rows - 1) * GAP_IN;
+    return MARGIN_IN + b * cellH + (b - 0.5) * GAP_IN;
+  };
+  const toPdfY = (yFromTopIn: number) => (SHEET_H_IN - yFromTopIn) * PT_PER_IN;
+  const toPdfX = (xIn: number) => xIn * PT_PER_IN;
+
+  const drawVerticalTick = (xIn: number, yFromTopIn: number, halfLenIn: number = CROP_MARK_HALF_LEN_IN) => {
+    page.drawLine({
+      start: { x: toPdfX(xIn), y: toPdfY(yFromTopIn - halfLenIn) },
+      end: { x: toPdfX(xIn), y: toPdfY(yFromTopIn + halfLenIn) },
+      thickness: CROP_MARK_THICKNESS,
+      color: CROP_MARK_COLOR,
+    });
+  };
+  const drawHorizontalTick = (xIn: number, yFromTopIn: number) => {
+    page.drawLine({
+      start: { x: toPdfX(xIn - CROP_MARK_HALF_LEN_IN), y: toPdfY(yFromTopIn) },
+      end: { x: toPdfX(xIn + CROP_MARK_HALF_LEN_IN), y: toPdfY(yFromTopIn) },
+      thickness: CROP_MARK_THICKNESS,
+      color: CROP_MARK_COLOR,
+    });
+  };
+  const drawCrosshair = (xIn: number, yFromTopIn: number) => {
+    drawVerticalTick(xIn, yFromTopIn);
+    drawHorizontalTick(xIn, yFromTopIn);
+  };
+
+  const clearOffsetIn = CROP_MARK_CLEARANCE_IN + CROP_MARK_HALF_LEN_IN;
+
+  // Single column stacked vertically (e.g. A4, 1x2): there's no column divider
+  // to cross, so marks go only on the right edge (the side with leftover
+  // space) — tick at the top corner, plus at each interior row divider (its
+  // vertical position stays the exact midpoint between the two posters), tick
+  // at the bottom corner. All three share the same X so they line up as one
+  // straight vertical line down the page.
+  if (cols === 1 && rows > 1) {
+    const x = colBoundaryXIn(cols) + CROP_MARK_CLEARANCE_IN;
+    drawVerticalTick(x, rowBoundaryYFromTopIn(0));
+    drawVerticalTick(x, rowBoundaryYFromTopIn(rows));
+    for (let r = 1; r < rows; r++) {
+      drawCrosshair(x, rowBoundaryYFromTopIn(r));
+    }
+    return;
+  }
+
+  // Mirror of the above for a single row of columns: marks go on the bottom edge only.
+  if (rows === 1 && cols > 1) {
+    const y = rowBoundaryYFromTopIn(rows);
+    drawHorizontalTick(colBoundaryXIn(0), y);
+    drawHorizontalTick(colBoundaryXIn(cols), y);
+    for (let b = 1; b < cols; b++) {
+      drawCrosshair(colBoundaryXIn(b), y);
+    }
+    return;
+  }
+
+  // General cols x rows grid (e.g. A5, 2x2): tick where an internal column
+  // divider meets the TOP of the grid, but a crosshair where it meets the
+  // BOTTOM (matches the reference — top and bottom aren't symmetric here).
+  // Left/right edges (where an internal row divider meets them) stay ticks.
+  for (let b = 1; b < cols; b++) {
+    const x = colBoundaryXIn(b);
+    drawVerticalTick(x, rowBoundaryYFromTopIn(0));
+    // Shifted below the poster's edge so the mark doesn't overlap it.
+    drawCrosshair(x, rowBoundaryYFromTopIn(rows) + clearOffsetIn);
+  }
+  for (let r = 1; r < rows; r++) {
+    const y = rowBoundaryYFromTopIn(r);
+    drawHorizontalTick(colBoundaryXIn(0), y);
+    drawHorizontalTick(colBoundaryXIn(cols), y);
+  }
+  // Bottom-left and bottom-right corner ticks, mirroring the top-center tick.
+  drawVerticalTick(colBoundaryXIn(0), rowBoundaryYFromTopIn(rows));
+  drawVerticalTick(colBoundaryXIn(cols), rowBoundaryYFromTopIn(rows));
+  for (let b = 1; b < cols; b++) {
+    for (let r = 1; r < rows; r++) {
+      drawCrosshair(colBoundaryXIn(b), rowBoundaryYFromTopIn(r));
+    }
+  }
+}
+
 // The /api/drive/files/:id/download proxy doesn't reliably forward Content-Type,
 // so blob.type can't be trusted to tell PNG from JPEG — sniff the real format instead.
 function sniffImageType(bytes: ArrayBuffer): 'image/png' | 'image/jpeg' {
@@ -177,9 +280,11 @@ async function fetchImageCache(posters: DriveFile[]): Promise<Map<string, Cached
 }
 
 // Builds one PDF (all sheets for a single size) from a pre-fetched image cache.
-async function renderPdf(sheets: SheetPlan[], imageCache: Map<string, CachedImage>): Promise<Blob> {
+async function renderPdf(sheets: SheetPlan[], imageCache: Map<string, CachedImage>, sizeKey: string): Promise<Blob> {
   const pdf = await PDFDocument.create();
   const embedCache = new Map<string, PDFImage>();
+
+  const cropMarks = CROP_MARK_SIZES.has(sizeKey) ? bestOrientation(PRINT_SIZES[sizeKey]) : null;
 
   async function getEmbeddedImage(posterId: string, rotate: boolean): Promise<PDFImage | null> {
     const key = `${posterId}:${rotate}`;
@@ -235,6 +340,10 @@ async function renderPdf(sheets: SheetPlan[], imageCache: Map<string, CachedImag
         height: drawHIn * PT_PER_IN,
       });
     }
+
+    if (cropMarks) {
+      drawCropMarks(page, cropMarks.cols, cropMarks.rows, cropMarks.orientation.w, cropMarks.orientation.h);
+    }
   }
 
   const pdfBytes = await pdf.save();
@@ -279,7 +388,7 @@ export async function buildOrderPdfZip(lines: OrderLine[]): Promise<Blob> {
 
   const zip = new JSZip();
   for (const [sizeKey, sheets] of sheetsBySize) {
-    const blob = await renderPdf(sheets, imageCache);
+    const blob = await renderPdf(sheets, imageCache, sizeKey);
     const safeName = sizeKey.replace(/[\\/:*?"<>|]/g, '-');
     zip.file(`${safeName}.pdf`, blob);
   }
