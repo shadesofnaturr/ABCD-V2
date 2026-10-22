@@ -11,7 +11,11 @@ dotenv.config({ path: ".env.local" });
 
 const upload = multer();
 
-const OAUTH_SCOPES = ["https://www.googleapis.com/auth/drive"];
+// drive.file (not the full drive scope) — only grants access to files this
+// app creates, which is all order-zip uploads ever need. Keeps the OAuth
+// consent screen at "sensitive" rather than "restricted", so publishing to
+// production doesn't require Google's security assessment.
+const OAUTH_SCOPES = ["https://www.googleapis.com/auth/drive.file"];
 
 function getOAuthClient() {
   const clientId = process.env.GOOGLE_OAUTH_CLIENT_ID;
@@ -29,17 +33,25 @@ function getOAuthClient() {
   return client;
 }
 
-// Persists the refresh token to .env.local so it survives server restarts —
-// this is a single-user local app, so a file write is simpler than a DB.
+// Best-effort: persists the refresh token to .env.local for local dev, so it
+// survives server restarts without re-authorizing. On a host with an
+// ephemeral/read-only filesystem (Render, Cloud Run, etc.) this file won't
+// exist and the write is skipped — the token still gets set on the running
+// process and is shown on the callback page for the admin to copy into that
+// host's own env var dashboard, since that's the only place it'll persist there.
 function persistRefreshToken(token: string) {
-  const envPath = ".env.local";
-  const existing = fs.readFileSync(envPath, "utf-8");
-  const line = `GOOGLE_OAUTH_REFRESH_TOKEN=${token}`;
-  const updated = /^GOOGLE_OAUTH_REFRESH_TOKEN=.*$/m.test(existing)
-    ? existing.replace(/^GOOGLE_OAUTH_REFRESH_TOKEN=.*$/m, line)
-    : `${existing.trimEnd()}\n${line}\n`;
-  fs.writeFileSync(envPath, updated);
   process.env.GOOGLE_OAUTH_REFRESH_TOKEN = token;
+  const envPath = ".env.local";
+  try {
+    const existing = fs.readFileSync(envPath, "utf-8");
+    const line = `GOOGLE_OAUTH_REFRESH_TOKEN=${token}`;
+    const updated = /^GOOGLE_OAUTH_REFRESH_TOKEN=.*$/m.test(existing)
+      ? existing.replace(/^GOOGLE_OAUTH_REFRESH_TOKEN=.*$/m, line)
+      : `${existing.trimEnd()}\n${line}\n`;
+    fs.writeFileSync(envPath, updated);
+  } catch {
+    // No writable .env.local here — fine, the caller shows the token instead.
+  }
 }
 
 async function startServer() {
@@ -313,7 +325,12 @@ async function startServer() {
         throw new Error("No refresh token returned — revoke the app's access at https://myaccount.google.com/permissions and try again (Google only issues a refresh token on first consent).");
       }
       persistRefreshToken(tokens.refresh_token);
-      res.send("<h2>Google Drive connected.</h2><p>You can close this tab.</p>");
+      res.send(`
+        <h2>Google Drive connected.</h2>
+        <p>If this server's filesystem doesn't persist (Render, Cloud Run, etc.), copy this value into your host's <code>GOOGLE_OAUTH_REFRESH_TOKEN</code> environment variable so it survives restarts/redeploys:</p>
+        <textarea readonly rows="3" style="width:100%;max-width:600px;font-family:monospace;padding:8px;">${tokens.refresh_token}</textarea>
+        <p>On local dev with a writable .env.local, it's already saved there — no action needed.</p>
+      `);
     } catch (error: any) {
       console.error("OAuth Callback Error:", error);
       res.status(500).send(`OAuth failed: ${error.message}`);
