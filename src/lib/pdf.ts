@@ -169,8 +169,6 @@ function drawCropMarks(page: PDFPage, cols: number, rows: number, cellW: number,
     drawHorizontalTick(xIn, yFromTopIn);
   };
 
-  const clearOffsetIn = CROP_MARK_CLEARANCE_IN + CROP_MARK_HALF_LEN_IN;
-
   // Single column stacked vertically (e.g. A4, 1x2): there's no column divider
   // to cross, so marks go only on the right edge (the side with leftover
   // space) — tick at the top corner, plus at each interior row divider (its
@@ -202,21 +200,22 @@ function drawCropMarks(page: PDFPage, cols: number, rows: number, cellW: number,
   // divider meets the TOP of the grid, but a crosshair where it meets the
   // BOTTOM (matches the reference — top and bottom aren't symmetric here).
   // Left/right edges (where an internal row divider meets them) stay ticks.
+  // The bottom crosshair and the bottom-corner ticks all sit on one shared
+  // line, offset from the poster edge by the standard clearance gap — not
+  // each independently offset, so they visually line up.
+  const bottomLineYIn = rowBoundaryYFromTopIn(rows) + CROP_MARK_CLEARANCE_IN;
   for (let b = 1; b < cols; b++) {
     const x = colBoundaryXIn(b);
     drawVerticalTick(x, rowBoundaryYFromTopIn(0));
-    // Shifted below the poster's edge so the mark doesn't overlap it.
-    drawCrosshair(x, rowBoundaryYFromTopIn(rows) + clearOffsetIn);
+    drawCrosshair(x, bottomLineYIn);
   }
   for (let r = 1; r < rows; r++) {
     const y = rowBoundaryYFromTopIn(r);
     drawHorizontalTick(colBoundaryXIn(0), y);
     drawHorizontalTick(colBoundaryXIn(cols), y);
   }
-  // Bottom-left and bottom-right corner ticks — horizontal, matching the
-  // left/right-edge ticks' orientation (not the top-center tick's).
-  drawHorizontalTick(colBoundaryXIn(0), rowBoundaryYFromTopIn(rows));
-  drawHorizontalTick(colBoundaryXIn(cols), rowBoundaryYFromTopIn(rows));
+  drawHorizontalTick(colBoundaryXIn(0), bottomLineYIn);
+  drawHorizontalTick(colBoundaryXIn(cols), bottomLineYIn);
   for (let b = 1; b < cols; b++) {
     for (let r = 1; r < rows; r++) {
       drawCrosshair(colBoundaryXIn(b), rowBoundaryYFromTopIn(r));
