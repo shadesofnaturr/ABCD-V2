@@ -213,9 +213,10 @@ function drawCropMarks(page: PDFPage, cols: number, rows: number, cellW: number,
     drawHorizontalTick(colBoundaryXIn(0), y);
     drawHorizontalTick(colBoundaryXIn(cols), y);
   }
-  // Bottom-left and bottom-right corner ticks, mirroring the top-center tick.
-  drawVerticalTick(colBoundaryXIn(0), rowBoundaryYFromTopIn(rows));
-  drawVerticalTick(colBoundaryXIn(cols), rowBoundaryYFromTopIn(rows));
+  // Bottom-left and bottom-right corner ticks — horizontal, matching the
+  // left/right-edge ticks' orientation (not the top-center tick's).
+  drawHorizontalTick(colBoundaryXIn(0), rowBoundaryYFromTopIn(rows));
+  drawHorizontalTick(colBoundaryXIn(cols), rowBoundaryYFromTopIn(rows));
   for (let b = 1; b < cols; b++) {
     for (let r = 1; r < rows; r++) {
       drawCrosshair(colBoundaryXIn(b), rowBoundaryYFromTopIn(r));
