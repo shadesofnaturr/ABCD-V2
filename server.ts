@@ -1,15 +1,18 @@
 import dotenv from "dotenv";
 import express from "express";
 import path from "path";
+import os from "os";
 import fs from "fs";
 import { createServer as createViteServer } from "vite";
 import { google } from "googleapis";
 import multer from "multer";
-import { Readable } from "stream";
 
 dotenv.config({ path: ".env.local" });
 
-const upload = multer();
+// Default multer storage buffers the whole upload in memory — on a
+// memory-constrained host (e.g. Render's free 512MB tier) that's enough to
+// OOM the process on a large order zip. Disk storage streams it instead.
+const upload = multer({ dest: os.tmpdir() });
 
 // drive.file (not the full drive scope) — only grants access to files this
 // app creates, which is all order-zip uploads ever need. Keeps the OAuth
@@ -188,7 +191,7 @@ async function startServer() {
         },
         media: {
           mimeType: file.mimetype,
-          body: Readable.from(file.buffer),
+          body: fs.createReadStream(file.path),
         },
         fields: 'id,name,thumbnailLink,webViewLink,description',
       });
@@ -197,6 +200,8 @@ async function startServer() {
     } catch (error: any) {
       console.error('Drive Upload Error:', error);
       res.status(500).json({ error: error.message });
+    } finally {
+      if (req.file) fs.unlink(req.file.path, () => {});
     }
   });
 
@@ -356,7 +361,7 @@ async function startServer() {
         },
         media: {
           mimeType: file.mimetype,
-          body: Readable.from(file.buffer),
+          body: fs.createReadStream(file.path),
         },
         fields: "id,name,webViewLink",
       });
@@ -365,6 +370,8 @@ async function startServer() {
     } catch (error: any) {
       console.error("Drive Upload (OAuth) Error:", error);
       res.status(500).json({ error: error.message });
+    } finally {
+      if (req.file) fs.unlink(req.file.path, () => {});
     }
   });
 
