@@ -798,41 +798,43 @@ const getCategoryIcon = (categoryName: string) => {
       const dateStr = new Date().toLocaleString();
 
       if (cartLines.length > 0) {
-        const sheetId = await getOrCreateOrdersSheet();
-        const posterNames = cartLines.map(l => {
-          const isSticker = l.poster.categoryHint === 'Stickers';
-          const sizeStr = !isSticker ? ` (${l.size})` : '';
-          return `${l.quantity}x ${formatPosterName(l.poster.name)}${sizeStr}`;
-        }).join(', ');
-        const totalQuantity = cartLines.reduce((sum, l) => sum + l.quantity, 0);
+        setIsGeneratingPdf(true);
+        try {
+          const sheetId = await getOrCreateOrdersSheet();
+          const posterNames = cartLines.map(l => {
+            const isSticker = l.poster.categoryHint === 'Stickers';
+            const sizeStr = !isSticker ? ` (${l.size})` : '';
+            return `${l.quantity}x ${formatPosterName(l.poster.name)}${sizeStr}`;
+          }).join(', ');
+          const totalQuantity = cartLines.reduce((sum, l) => sum + l.quantity, 0);
 
-        let zipLink = '';
-        const printLines = cartLines.filter(l => l.poster.categoryHint !== 'Stickers');
-        if (printLines.length > 0) {
-          setIsGeneratingPdf(true);
-          try {
-            const safeFilePart = (s: string) => s.replace(/[\\/:*?"<>|]/g, '-').trim();
-            const zipFilename = `${safeFilePart(customerName) || 'Order'} - ${safeFilePart(dateStr)}.zip`;
-            const blob = await buildOrderPdfZip(printLines);
-            const folderId = await getOrCreateOrdersUploadFolder();
-            const uploaded = await uploadOrderZip(folderId, blob, zipFilename);
-            zipLink = uploaded.webViewLink || '';
-          } catch (err) {
-            console.error('Order PDF generation/upload failed:', err);
-          } finally {
-            setIsGeneratingPdf(false);
+          let zipLink = '';
+          const printLines = cartLines.filter(l => l.poster.categoryHint !== 'Stickers');
+          if (printLines.length > 0) {
+            try {
+              const safeFilePart = (s: string) => s.replace(/[\\/:*?"<>|]/g, '-').trim();
+              const zipFilename = `${safeFilePart(customerName) || 'Order'} - ${safeFilePart(dateStr)}.zip`;
+              const blob = await buildOrderPdfZip(printLines);
+              const folderId = await getOrCreateOrdersUploadFolder();
+              const uploaded = await uploadOrderZip(folderId, blob, zipFilename);
+              zipLink = uploaded.webViewLink || '';
+            } catch (err) {
+              console.error('Order PDF generation/upload failed:', err);
+            }
           }
-        }
 
-        await appendOrderRow(sheetId, [
-          dateStr,
-          customerName,
-          customerPhone,
-          posterNames,
-          totalQuantity.toString(),
-          clientEmail.trim().toLowerCase(),
-          zipLink
-        ]);
+          await appendOrderRow(sheetId, [
+            dateStr,
+            customerName,
+            customerPhone,
+            posterNames,
+            totalQuantity.toString(),
+            clientEmail.trim().toLowerCase(),
+            zipLink
+          ]);
+        } finally {
+          setIsGeneratingPdf(false);
+        }
       }
 
       setSubmitSuccess(true);
@@ -3291,7 +3293,7 @@ const getCategoryIcon = (categoryName: string) => {
                               if (currentQty <= 4) {
                                 safeVal = isSelected ? 0 : 8;
                               } else {
-                                safeVal = currentQty - 4;
+                                safeVal = Math.min(100, currentQty - 4);
                               }
                             } else {
                               safeVal = Math.max(isSelected ? 0 : 1, currentQty - 1);
@@ -3317,6 +3319,7 @@ const getCategoryIcon = (categoryName: string) => {
                               if (isSticker && safeVal > 0) {
                                 if (safeVal < 4) safeVal = 4;
                                 else if (safeVal % 4 !== 0) safeVal = safeVal + (4 - (safeVal % 4));
+                                safeVal = Math.min(100, safeVal);
                               } else if (!isSticker) {
                                 safeVal = Math.min(100, safeVal);
                               }
@@ -3336,7 +3339,7 @@ const getCategoryIcon = (categoryName: string) => {
 
                             let newQty;
                             if (isSticker) {
-                              newQty = currentQty === 0 ? 4 : currentQty + 4;
+                              newQty = Math.min(100, currentQty === 0 ? 4 : currentQty + 4);
                             } else {
                               newQty = Math.min(100, currentQty + 1);
                             }
