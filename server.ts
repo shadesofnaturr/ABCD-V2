@@ -6,6 +6,7 @@ import fs from "fs";
 import { createServer as createViteServer } from "vite";
 import { google } from "googleapis";
 import multer from "multer";
+import { buildAndUploadOrder } from "./order-build";
 
 dotenv.config({ path: ".env.local" });
 
@@ -389,6 +390,104 @@ async function startServer() {
     }
   });
 
+  // Under the drive.file OAuth scope the app can only touch files/folders IT
+  // created through this OAuth client — a pre-existing folder (even one the
+  // OAuth user owns, or one shared only with the service account) is invisible
+  // and yields 404 when used as an upload parent. So the order-zip upload
+  // target has to be created *by* the OAuth account itself. This find-or-creates
+  // that folder using the OAuth client; because files.list under drive.file only
+  // ever returns app-created files, the lookup stays idempotent across restarts.
+  const OAUTH_UPLOAD_FOLDER_NAME = "Orders";
+  app.get("/api/drive/oauth-upload-folder", async (req, res) => {
+    try {
+      if (!process.env.GOOGLE_OAUTH_REFRESH_TOKEN) {
+        throw new Error("Google Drive isn't connected yet — visit /api/oauth/connect once to authorize.");
+      }
+      const auth = getOAuthClient();
+      const drive = google.drive({ version: "v3", auth });
+
+      const existing = await drive.files.list({
+        q: `name='${OAUTH_UPLOAD_FOLDER_NAME}' and mimeType='application/vnd.google-apps.folder' and trashed=false`,
+        fields: "files(id,name)",
+      });
+      const found = existing.data.files?.[0];
+      if (found?.id) {
+        res.json({ id: found.id });
+        return;
+      }
+
+      const created = await drive.files.create({
+        requestBody: { name: OAUTH_UPLOAD_FOLDER_NAME, mimeType: "application/vnd.google-apps.folder" },
+        fields: "id",
+      });
+      res.json({ id: created.data.id });
+    } catch (error: any) {
+      console.error("OAuth Upload Folder Error:", error);
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // Google's resumable-upload PUT endpoint doesn't send CORS headers, so the
+  // browser can't PUT to it directly — this relays each chunk server-to-server
+  // instead (not subject to CORS at all). The client sends chunks small
+  // enough to stay under any platform's request-size limit (Cloud Run's hard
+  // 32MB cap in particular); this route just forwards each one to Google
+  // with its Content-Range header and relays Google's response back.
+  app.post("/api/drive/upload-chunk", express.raw({ type: "*/*", limit: "20mb" }), async (req, res) => {
+    try {
+      const uploadUrl = req.header("X-Upload-Url");
+      const contentRange = req.header("Content-Range");
+      if (!uploadUrl || !contentRange) throw new Error("Missing X-Upload-Url or Content-Range header");
+
+      const relayRes = await fetch(uploadUrl, {
+        method: "PUT",
+        headers: {
+          "Content-Range": contentRange,
+        },
+        body: req.body,
+        redirect: "manual",
+      });
+
+      const text = await relayRes.text();
+      res.status(relayRes.status);
+      const rangeHeader = relayRes.headers.get("Range");
+      if (rangeHeader) res.setHeader("Range", rangeHeader);
+      res.setHeader("Content-Type", relayRes.headers.get("Content-Type") || "application/json");
+      res.send(text);
+    } catch (error: any) {
+      console.error("Drive Upload Chunk Error:", error);
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // Server-side streaming order build: the browser POSTs only the order
+  // manifest (a few KB), and the server fetches full-res images from Drive,
+  // builds one print-ready PDF per size, and uploads them to a per-order Drive
+  // folder — all streaming, bounded memory, no browser involvement and no
+  // request-size limits (the big bytes only ever move server<->Google).
+  app.post("/api/orders/build", express.json({ limit: "4mb" }), async (req, res) => {
+    const { lines, customerName } = req.body || {};
+    if (!Array.isArray(lines) || lines.length === 0) {
+      return res.status(400).json({ error: "Missing order lines" });
+    }
+    // Newline-delimited JSON stream: one object per line — progress events
+    // while building/uploading, then a final { done: true, ...result }, or
+    // { error } if it fails after streaming has already started.
+    res.setHeader("Content-Type", "application/x-ndjson");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.flushHeaders?.();
+    const send = (obj: any) => res.write(JSON.stringify(obj) + "\n");
+    try {
+      const result = await buildAndUploadOrder({ lines, customerName }, (p) => send(p));
+      send({ done: true, ...result });
+      res.end();
+    } catch (error: any) {
+      console.error("Order Build Error:", error);
+      send({ error: error.message });
+      res.end();
+    }
+  });
+
   // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
@@ -404,9 +503,14 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
+  const server = app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on port ${PORT}`);
   });
+  // Order builds stream large PDFs server-side and can legitimately run for
+  // several minutes; lift Node's default 5-min request timeout so a big
+  // synchronous build isn't cut off mid-stream. (Once builds move to an async
+  // job this endpoint returns immediately and this won't be needed.)
+  server.requestTimeout = 0;
 }
 
 startServer();

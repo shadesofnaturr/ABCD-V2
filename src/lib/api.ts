@@ -163,11 +163,15 @@ export async function uploadImageToFolder(folderId: string, file: File): Promise
 // The service account has zero Drive storage quota, so order-zip uploads go
 // through the OAuth-authorized owner account instead (one-time admin login,
 // see /api/oauth/connect). Large orders can produce zips well over hosting
-// platforms' request-size limits (e.g. Cloud Run's hard 32MB cap), so the
-// zip bytes never pass through our server at all — the server only starts a
-// Drive resumable-upload session (needs the OAuth credentials), and this
-// function PUTs the file directly from the browser straight to Google.
-export async function uploadOrderZip(folderId: string, blob: Blob, filename: string): Promise<{ id: string; webViewLink: string }> {
+// platforms' request-size limits (e.g. Cloud Run's hard 32MB cap) — and
+// Google's resumable-upload endpoint doesn't send CORS headers, so a direct
+// browser-to-Drive PUT isn't possible at all. So this sends the zip to our
+// own server in small chunks (each well under any platform's size limit),
+// and the server relays each chunk to Drive server-to-server (not subject to
+// CORS). onProgress reports a 0-1 fraction of bytes uploaded.
+const UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024; // must be a multiple of 256KiB per Drive's resumable upload spec
+
+export async function uploadOrderZip(folderId: string, blob: Blob, filename: string, onProgress?: (fraction: number) => void): Promise<{ id: string; webViewLink: string }> {
   const sessionRes = await fetch(`${API_BASE}/drive/upload-session`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -179,24 +183,119 @@ export async function uploadOrderZip(folderId: string, blob: Blob, filename: str
   }
   const { uploadUrl } = await sessionRes.json();
 
-  const uploadRes = await fetch(uploadUrl, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/zip' },
-    body: blob
-  });
-  if (!uploadRes.ok) {
-    const text = await uploadRes.text().catch(() => '');
-    throw new Error(`Zip upload to Drive failed: ${uploadRes.status} ${text}`);
+  const totalSize = blob.size;
+  let offset = 0;
+  while (offset < totalSize) {
+    const end = Math.min(offset + UPLOAD_CHUNK_SIZE, totalSize);
+    const chunk = blob.slice(offset, end);
+
+    const chunkRes = await fetch(`${API_BASE}/drive/upload-chunk`, {
+      method: 'POST',
+      headers: {
+        'X-Upload-Url': uploadUrl,
+        'Content-Range': `bytes ${offset}-${end - 1}/${totalSize}`,
+        // blob.slice() drops the MIME type, so without an explicit Content-Type
+        // the chunk goes out typeless and the server's express.raw parser skips
+        // it (req.body ends up {} and relays as the 15-byte "[object Object]").
+        'Content-Type': 'application/octet-stream',
+      },
+      body: chunk
+    });
+
+    if (chunkRes.status === 308) {
+      // Resume Incomplete — expected for every chunk except the last.
+      offset = end;
+      onProgress?.(offset / totalSize);
+      continue;
+    }
+
+    if (chunkRes.ok) {
+      onProgress?.(1);
+      return chunkRes.json();
+    }
+
+    const text = await chunkRes.text().catch(() => '');
+    throw new Error(`Zip upload to Drive failed: ${chunkRes.status} ${text}`);
   }
-  return uploadRes.json();
+
+  throw new Error('Zip upload to Drive ended without a final response');
 }
 
+// --- Server-side streaming order build ---
+// The browser POSTs just the order manifest; the server fetches full-res
+// images, builds one print-ready PDF per size, and uploads them to a per-order
+// Drive folder — streaming NDJSON progress back as it goes. This replaces the
+// old browser-side PDF build + zip upload entirely (which OOM'd on big orders).
+export interface BuildProgressEvent {
+  phase?: 'generating' | 'uploading';
+  fetched?: number;
+  total?: number;
+  size?: string;
+  percent?: number;
+}
+
+export interface OrderBuildResult {
+  orderFolderId: string;
+  orderFolderLink: string;
+  files: { size: string; id: string; link: string; bytes: number; sheets: number; missing: string[] }[];
+}
+
+export interface OrderManifest {
+  lines: { poster: { id: string; name: string }; size: string; quantity: number }[];
+  customerName?: string;
+}
+
+export async function submitOrderBuild(manifest: OrderManifest, onProgress?: (e: BuildProgressEvent) => void): Promise<OrderBuildResult> {
+  const res = await fetch(`${API_BASE}/orders/build`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(manifest)
+  });
+  if (!res.ok || !res.body) {
+    const err = await res.json().catch(() => null);
+    throw new Error(err?.error || `Order build failed with status ${res.status}`);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let result: OrderBuildResult | null = null;
+
+  const handleLine = (line: string) => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    let evt: any;
+    try { evt = JSON.parse(trimmed); } catch { return; }
+    if (evt.error) throw new Error(evt.error);
+    if (evt.done) result = evt as OrderBuildResult;
+    else onProgress?.(evt as BuildProgressEvent);
+  };
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let nl: number;
+    while ((nl = buffer.indexOf('\n')) >= 0) {
+      handleLine(buffer.slice(0, nl));
+      buffer = buffer.slice(nl + 1);
+    }
+  }
+  handleLine(buffer);
+
+  if (!result) throw new Error('Order build ended without a result');
+  return result;
+}
+
+// The order-zip upload runs under the OAuth account with the narrow drive.file
+// scope, which can only write into folders that same OAuth client created. So
+// the upload folder is resolved (and created on first use) server-side via the
+// OAuth client — not the service account — otherwise its parent would be
+// invisible to the upload and Drive would reject it with a 404.
 export async function getOrCreateOrdersUploadFolder(): Promise<string> {
-  const q = `name='Orders' and mimeType='application/vnd.google-apps.folder' and trashed=false`;
-  const data = await fetchAPI(`${API_BASE}/drive/files?method=list&q=${encodeURIComponent(q)}&fields=${encodeURIComponent('files(id,name)')}`);
-  const files = data.files || [];
-  if (files.length > 0) return files[0].id;
-  throw new Error("No Drive folder named 'Orders' found — create one and share it with the connected account.");
+  const data = await fetchAPI(`${API_BASE}/drive/oauth-upload-folder`);
+  if (!data.id) throw new Error('Could not resolve the Drive upload folder');
+  return data.id;
 }
 
 export async function getOrCreateOrdersSheet(): Promise<string> {
@@ -205,7 +304,7 @@ export async function getOrCreateOrdersSheet(): Promise<string> {
   const files = data.files || [];
   if (files.length > 0) {
     const sheetId = files[0].id;
-    await ensureOrdersSheetHasZipLinkColumn(sheetId);
+    await ensureOrdersSheetColumns(sheetId);
     return sheetId;
   }
 
@@ -219,35 +318,51 @@ export async function getOrCreateOrdersSheet(): Promise<string> {
   });
 
   const sheetId = createRes.spreadsheetId;
-  await appendOrderRow(sheetId, ['Date', 'Customer Name', 'Phone Number', 'Selected Posters', 'Poster Count', 'User Email', 'Zip Link']);
+  await appendOrderRow(sheetId, ['Date', 'Customer Name', 'Phone Number', 'Selected Posters', 'Poster Count', 'User Email', 'Order Link', 'Status']);
   return sheetId;
 }
 
-// Older sheets were created before the 'Zip Link' column existed — backfill
-// the header once so existing spreadsheets pick it up without manual edits.
-async function ensureOrdersSheetHasZipLinkColumn(sheetId: string): Promise<void> {
+// Older sheets predate the 'Order Link' (G) and 'Status' (H) columns — backfill
+// those headers once so existing spreadsheets pick them up without manual edits.
+async function ensureOrdersSheetColumns(sheetId: string): Promise<void> {
   try {
-    const data = await fetchAPI(`${API_BASE}/sheets/${sheetId}/values/Orders!G1`);
-    const hasHeader = (data.values?.[0]?.[0] || '').trim().length > 0;
-    if (!hasHeader) {
-      await fetchAPI(`${API_BASE}/sheets/${sheetId}/values/Orders!G1`, {
+    const data = await fetchAPI(`${API_BASE}/sheets/${sheetId}/values/Orders!G1:H1`);
+    const g = (data.values?.[0]?.[0] || '').trim();
+    const h = (data.values?.[0]?.[1] || '').trim();
+    if (!g || !h) {
+      await fetchAPI(`${API_BASE}/sheets/${sheetId}/values/Orders!G1:H1`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ values: [['Zip Link']] })
+        body: JSON.stringify({ values: [[g || 'Order Link', h || 'Status']] })
       });
     }
   } catch (err) {
-    console.warn('Could not verify/backfill Zip Link column:', err);
+    console.warn('Could not verify/backfill Order Link/Status columns:', err);
   }
 }
 
-export async function appendOrderRow(sheetId: string, rowData: string[]) {
-  const range = 'Orders!A:G';
+// Appends a row and returns its 1-based sheet row index (so the caller can
+// update its Status/link later once the print files finish building).
+export async function appendOrderRow(sheetId: string, rowData: string[]): Promise<number | null> {
+  const range = 'Orders!A:H';
   const url = `${API_BASE}/sheets/${sheetId}/values/${range}`;
-  await fetchAPI(url, {
+  const data = await fetchAPI(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ values: [rowData] })
+  });
+  const m = /!A(\d+)/.exec(data?.updates?.updatedRange || '');
+  return m ? parseInt(m[1], 10) : null;
+}
+
+// Updates an existing order row's Order Link (G) and Status (H) in place.
+export async function updateOrderRowStatus(sheetId: string, rowIndex: number, link: string, status: string): Promise<void> {
+  const range = `Orders!G${rowIndex}:H${rowIndex}`;
+  const url = `${API_BASE}/sheets/${sheetId}/values/${range}`;
+  await fetchAPI(url, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ values: [[link, status]] })
   });
 }
 
@@ -259,12 +374,13 @@ export interface SheetOrder {
   count: string;
   email: string;
   zipLink: string;
+  status: string;
 }
 
 export async function fetchUserOrdersFromSheet(email: string, phone: string): Promise<SheetOrder[]> {
   try {
     const sheetId = await getOrCreateOrdersSheet();
-    const range = 'Orders!A:G';
+    const range = 'Orders!A:H';
     const data = await fetchAPI(`${API_BASE}/sheets/${sheetId}/values/${range}`);
     const rows = data.values || [];
 
@@ -276,7 +392,8 @@ export async function fetchUserOrdersFromSheet(email: string, phone: string): Pr
       posters: row[3] || '',
       count: row[4] || '',
       email: row[5] || '',
-      zipLink: row[6] || ''
+      zipLink: row[6] || '',
+      status: row[7] || ''
     }));
     
     return orders.filter(o => {

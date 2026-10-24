@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
-import { buildOrderPdfZip, PRINT_SIZE_KEYS } from './lib/pdf';
+import { PRINT_SIZE_KEYS } from './lib/pdf';
 import { ShoppingCart, CheckCircle, ChevronLeft, ChevronRight, Image as ImageIcon, Folder, Loader2, ArrowRight, Edit2, Trash2, X, Search, Menu, User as UserIcon, Bell, Phone, Mail, Instagram, ShoppingBag, Heart, LayoutGrid, List, Sparkles, Car, Smile, Compass, Film, Zap, BookOpen, Music, Trophy, Star } from 'lucide-react';
-import { getRootFolders, getFoldersInFolder, getImagesInFolder, getOrCreateOrdersSheet, appendOrderRow, appendCustomOrderRow, createDriveFolder, getOrCreateMainOrdersFolder, getOrCreateMainCatalogsFolder, getOrCreateMainCustomOrdersFolder, getOrCreateCustomOrdersSheet, updateDriveFolder, deleteDriveFolder, uploadImageToFolder, updateDriveFile, copyDriveFile, DriveFolder, DriveFile, getOrCreateUsersSheet, appendUserRow, updateUserRow, fetchAllUsers, fetchUserOrdersFromSheet, SheetOrder, getOrCreateOrdersUploadFolder, uploadOrderZip } from './lib/api';
+import { getRootFolders, getFoldersInFolder, getImagesInFolder, getOrCreateOrdersSheet, appendOrderRow, appendCustomOrderRow, createDriveFolder, getOrCreateMainOrdersFolder, getOrCreateMainCatalogsFolder, getOrCreateMainCustomOrdersFolder, getOrCreateCustomOrdersSheet, updateDriveFolder, deleteDriveFolder, uploadImageToFolder, updateDriveFile, copyDriveFile, DriveFolder, DriveFile, getOrCreateUsersSheet, appendUserRow, updateUserRow, fetchAllUsers, fetchUserOrdersFromSheet, SheetOrder, submitOrderBuild, updateOrderRowStatus } from './lib/api';
 import { cn } from './lib/utils';
 
 const SECURITY_QUESTIONS = [
@@ -422,6 +422,9 @@ const getCategoryIcon = (categoryName: string) => {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [submitSuccess, setSubmitSuccess] = useState(false);
   const [isGeneratingPdf, setIsGeneratingPdf] = useState(false);
+  const [orderProgress, setOrderProgress] = useState(0);
+  const [orderPhase, setOrderPhase] = useState('');
+  const [orderWarning, setOrderWarning] = useState('');
 
   const [checkoutError, setCheckoutError] = useState('');
 
@@ -781,6 +784,7 @@ const getCategoryIcon = (categoryName: string) => {
   const handleSubmitOrder = async (e: React.FormEvent) => {
     e.preventDefault();
     setCheckoutError('');
+    setOrderWarning('');
     if (!customerName || !customerPhone || cartLines.length === 0) return;
 
     if (customerName.trim().length < 3) {
@@ -798,43 +802,62 @@ const getCategoryIcon = (categoryName: string) => {
       const dateStr = new Date().toLocaleString();
 
       if (cartLines.length > 0) {
-        setIsGeneratingPdf(true);
-        try {
-          const sheetId = await getOrCreateOrdersSheet();
-          const posterNames = cartLines.map(l => {
-            const isSticker = l.poster.categoryHint === 'Stickers';
-            const sizeStr = !isSticker ? ` (${l.size})` : '';
-            return `${l.quantity}x ${formatPosterName(l.poster.name)}${sizeStr}`;
-          }).join(', ');
-          const totalQuantity = cartLines.reduce((sum, l) => sum + l.quantity, 0);
+        const sheetId = await getOrCreateOrdersSheet();
+        const posterNames = cartLines.map(l => {
+          const isSticker = l.poster.categoryHint === 'Stickers';
+          const sizeStr = !isSticker ? ` (${l.size})` : '';
+          return `${l.quantity}x ${formatPosterName(l.poster.name)}${sizeStr}`;
+        }).join(', ');
+        const totalQuantity = cartLines.reduce((sum, l) => sum + l.quantity, 0);
+        const printLines = cartLines.filter(l => l.poster.categoryHint !== 'Stickers');
+        const needsFiles = printLines.length > 0;
 
-          let zipLink = '';
-          const printLines = cartLines.filter(l => l.poster.categoryHint !== 'Stickers');
-          if (printLines.length > 0) {
-            try {
-              const safeFilePart = (s: string) => s.replace(/[\\/:*?"<>|]/g, '-').trim();
-              const zipFilename = `${safeFilePart(customerName) || 'Order'} - ${safeFilePart(dateStr)}.zip`;
-              const blob = await buildOrderPdfZip(printLines);
-              const folderId = await getOrCreateOrdersUploadFolder();
-              const uploaded = await uploadOrderZip(folderId, blob, zipFilename);
-              zipLink = uploaded.webViewLink || '';
-            } catch (err) {
-              console.error('Order PDF generation/upload failed:', err);
-              zipLink = 'UPLOAD FAILED — see server logs';
+        // Record the order immediately (status Processing) so it's never lost,
+        // even if file generation later fails or the page is closed. The slow
+        // PDF build runs server-side afterwards and flips the row to Ready.
+        const rowIndex = await appendOrderRow(sheetId, [
+          dateStr,
+          customerName,
+          customerPhone,
+          posterNames,
+          totalQuantity.toString(),
+          clientEmail.trim().toLowerCase(),
+          '',
+          needsFiles ? 'Processing' : 'Ready'
+        ]);
+
+        if (needsFiles) {
+          setIsGeneratingPdf(true);
+          setOrderProgress(0);
+          setOrderPhase('Saving your order');
+          setOrderWarning('');
+          try {
+            const manifest = {
+              lines: printLines.map(l => ({ poster: { id: l.poster.id, name: l.poster.name }, size: l.size, quantity: l.quantity })),
+              customerName,
+            };
+            const result = await submitOrderBuild(manifest, (e) => {
+              if (e.phase === 'generating') {
+                setOrderPhase('Generating print files');
+                setOrderProgress(e.total ? Math.round((e.fetched! / e.total) * 80) : 0);
+              } else if (e.phase === 'uploading') {
+                setOrderPhase('Uploading your files');
+                setOrderProgress(80 + Math.round((e.percent || 0) * 0.19));
+              }
+            });
+            setOrderProgress(100);
+            const missingCount = result.files.reduce((n, f) => n + (f.missing?.length || 0), 0);
+            if (rowIndex) await updateOrderRowStatus(sheetId, rowIndex, result.orderFolderLink || '', 'Ready');
+            if (missingCount > 0) {
+              setOrderWarning(`${missingCount} poster${missingCount > 1 ? 's' : ''} couldn't be added to the print files — our team will follow up.`);
             }
+          } catch (err) {
+            console.error('Order build failed:', err);
+            if (rowIndex) await updateOrderRowStatus(sheetId, rowIndex, '', 'Needs attention').catch(() => {});
+            setOrderWarning("We couldn't finish preparing your print files automatically. Your order was still placed — our team has been notified and will follow up.");
+          } finally {
+            setIsGeneratingPdf(false);
           }
-
-          await appendOrderRow(sheetId, [
-            dateStr,
-            customerName,
-            customerPhone,
-            posterNames,
-            totalQuantity.toString(),
-            clientEmail.trim().toLowerCase(),
-            zipLink
-          ]);
-        } finally {
-          setIsGeneratingPdf(false);
         }
       }
 
@@ -1605,10 +1628,16 @@ const getCategoryIcon = (categoryName: string) => {
         {/* PDF GENERATION LOADING VIEW */}
         {isGeneratingPdf ? (
           <div className="flex flex-col items-center justify-center py-24 text-center animate-in fade-in duration-300">
-            <Loader2 className="w-10 h-10 text-black animate-spin mb-8" />
             <h2 className="text-xl font-light tracking-[0.2em] uppercase mb-4 text-[#1A1A1A]">Preparing Your Order</h2>
-            <p className="text-[11px] text-[#999] uppercase tracking-wider max-w-md mx-auto leading-relaxed font-bold text-center">
-              Generating a print-ready PDF for each size and zipping them up. This will just take a moment.
+            <p className="text-[11px] text-[#999] uppercase tracking-wider max-w-md mx-auto leading-relaxed font-bold text-center mb-8">
+              {orderPhase || 'Preparing'}…
+            </p>
+            <div className="w-full max-w-sm h-2 bg-[#F0F0F0] border border-[#E5E5E5] overflow-hidden">
+              <div className="h-full bg-black transition-all duration-300 ease-out" style={{ width: `${orderProgress}%` }} />
+            </div>
+            <p className="text-[11px] text-[#999] font-bold mt-3 tracking-widest">{orderProgress}%</p>
+            <p className="text-[10px] text-[#BBB] uppercase tracking-wider max-w-xs mx-auto mt-6 leading-relaxed text-center">
+              Please keep this page open while we prepare your print-ready files.
             </p>
           </div>
         ) : /* SUCCESS VIEW */
@@ -1618,9 +1647,14 @@ const getCategoryIcon = (categoryName: string) => {
               <span className="text-2xl text-black">✓</span>
             </div>
             <h2 className="text-xl font-light tracking-[0.2em] uppercase mb-4 text-[#1A1A1A]">Order Confirmed</h2>
-            <p className="text-[11px] text-[#999] uppercase tracking-wider max-w-md mx-auto mb-10 leading-relaxed font-bold text-center">
+            <p className="text-[11px] text-[#999] uppercase tracking-wider max-w-md mx-auto mb-6 leading-relaxed font-bold text-center">
               THANK YOU {customerName.toUpperCase()}. YOUR ORDER HAS BEEN PLACED. WE WILL CONTACT YOU AT {customerPhone}.
             </p>
+            {orderWarning && (
+              <div className="max-w-md mx-auto mb-8 px-4 py-3 bg-[#FFF7ED] border border-[#FDBA74] text-[#9A3412] text-[10px] font-bold uppercase tracking-wide text-center leading-relaxed">
+                {orderWarning}
+              </div>
+            )}
             <div className="flex flex-col sm:flex-row gap-4 justify-center">
               <button
                 onClick={() => {
