@@ -488,6 +488,63 @@ async function startServer() {
     }
   });
 
+  // Minimal privacy policy page. Google's OAuth consent screen requires a
+  // privacy-policy URL to publish the app (needed so the Drive refresh token
+  // doesn't expire every 7 days), even though only the owner account connects.
+  app.get("/privacy", (_req, res) => {
+    res.type("html").send(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Privacy Policy — ABCD Creators</title>
+  <style>
+    body { font-family: -apple-system, system-ui, Segoe UI, Roboto, sans-serif; max-width: 720px; margin: 48px auto; padding: 0 20px; color: #1a1a1a; line-height: 1.6; }
+    h1 { font-weight: 600; letter-spacing: 0.02em; }
+    h2 { font-size: 1.1rem; margin-top: 2rem; }
+    .muted { color: #777; font-size: 0.9rem; }
+    code { background: #f4f4f4; padding: 1px 5px; border-radius: 3px; }
+  </style>
+</head>
+<body>
+  <h1>Privacy Policy</h1>
+  <p class="muted">ABCD Creators poster gallery &amp; studio · Last updated 24 October 2026</p>
+
+  <p>This policy explains what information the ABCD Creators poster-ordering app
+  collects, how it is used, and how Google user data is handled.</p>
+
+  <h2>Information we collect</h2>
+  <p>When you place an order we collect the details you provide — your name,
+  phone number, email address, and the posters and sizes you select. We do not
+  collect payment information through this app.</p>
+
+  <h2>How we use it</h2>
+  <p>Your order details are used solely to prepare and fulfil your poster order
+  and to contact you about it. They are stored in our own Google Drive and
+  Google Sheets, accessible only to ABCD Creators. We do not sell or share your
+  information with third parties for marketing.</p>
+
+  <h2>Google user data</h2>
+  <p>The app connects to the store owner's Google account using the
+  <code>drive.file</code> scope. This grants access <em>only</em> to files the
+  app itself creates (the generated print-ready order files it saves to the
+  owner's Drive). It cannot see or touch any other files in that Google
+  account. Use of information received from Google APIs follows the
+  <a href="https://developers.google.com/terms/api-services-user-data-policy">Google API Services User Data Policy</a>,
+  including the Limited Use requirements.</p>
+
+  <h2>Data retention</h2>
+  <p>Order records and generated files are kept for as long as needed to fulfil
+  and account for orders. You may request deletion of your order information by
+  contacting us.</p>
+
+  <h2>Contact</h2>
+  <p>For any questions about this policy or your data, email
+  <a href="mailto:shadesofnaturr@gmail.com">shadesofnaturr@gmail.com</a>.</p>
+</body>
+</html>`);
+  });
+
   // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
