@@ -162,23 +162,33 @@ export async function uploadImageToFolder(folderId: string, file: File): Promise
 
 // The service account has zero Drive storage quota, so order-zip uploads go
 // through the OAuth-authorized owner account instead (one-time admin login,
-// see /api/oauth/connect) — this route runs as that real account.
+// see /api/oauth/connect). Large orders can produce zips well over hosting
+// platforms' request-size limits (e.g. Cloud Run's hard 32MB cap), so the
+// zip bytes never pass through our server at all — the server only starts a
+// Drive resumable-upload session (needs the OAuth credentials), and this
+// function PUTs the file directly from the browser straight to Google.
 export async function uploadOrderZip(folderId: string, blob: Blob, filename: string): Promise<{ id: string; webViewLink: string }> {
-  const metadata = { name: filename, parents: [folderId] };
-  const form = new FormData();
-  form.append('metadata', JSON.stringify(metadata));
-  form.append('file', blob, filename);
-
-  const res = await fetch(`${API_BASE}/drive/upload-as-user`, {
+  const sessionRes = await fetch(`${API_BASE}/drive/upload-session`, {
     method: 'POST',
-    body: form
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: filename, parents: [folderId], mimeType: 'application/zip' })
   });
-
-  if (!res.ok) {
-    const errorData = await res.json().catch(() => null);
-    throw new Error(errorData?.error || 'Zip upload failed');
+  if (!sessionRes.ok) {
+    const errorData = await sessionRes.json().catch(() => null);
+    throw new Error(errorData?.error || 'Could not start Drive upload session');
   }
-  return res.json();
+  const { uploadUrl } = await sessionRes.json();
+
+  const uploadRes = await fetch(uploadUrl, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/zip' },
+    body: blob
+  });
+  if (!uploadRes.ok) {
+    const text = await uploadRes.text().catch(() => '');
+    throw new Error(`Zip upload to Drive failed: ${uploadRes.status} ${text}`);
+  }
+  return uploadRes.json();
 }
 
 export async function getOrCreateOrdersUploadFolder(): Promise<string> {

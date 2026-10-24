@@ -342,36 +342,50 @@ async function startServer() {
     }
   });
 
-  app.post("/api/drive/upload-as-user", upload.single("file"), async (req, res) => {
+  // Order zips can be well over Cloud Run's hard 32MB request-body limit, so
+  // the file itself can't be posted through this server. Instead this route
+  // only *initiates* a Drive resumable-upload session (using the server's
+  // OAuth credentials) and hands the browser the session URL — the browser
+  // then PUTs the actual bytes straight to Google, bypassing this server
+  // (and its platform request-size ceiling) entirely. Resumable upload URLs
+  // are officially supported for direct browser uploads and don't need the
+  // OAuth token to be exposed client-side.
+  app.post("/api/drive/upload-session", async (req, res) => {
     try {
       if (!process.env.GOOGLE_OAUTH_REFRESH_TOKEN) {
         throw new Error("Google Drive isn't connected yet — visit /api/oauth/connect once to authorize.");
       }
+      const { name, parents, mimeType } = req.body;
+      if (!name || !mimeType) throw new Error("Missing name or mimeType");
+
       const auth = getOAuthClient();
-      const drive = google.drive({ version: "v3", auth });
+      const { token } = await auth.getAccessToken();
 
-      const metadata = JSON.parse(req.body.metadata);
-      const file = req.file;
-      if (!file) throw new Error("No file uploaded");
+      const initRes = await fetch(
+        "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id,name,webViewLink",
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json; charset=UTF-8",
+            "X-Upload-Content-Type": mimeType,
+          },
+          body: JSON.stringify({ name, parents }),
+        }
+      );
 
-      const response = await drive.files.create({
-        requestBody: {
-          name: metadata.name,
-          parents: metadata.parents,
-        },
-        media: {
-          mimeType: file.mimetype,
-          body: fs.createReadStream(file.path),
-        },
-        fields: "id,name,webViewLink",
-      });
+      if (!initRes.ok) {
+        const text = await initRes.text();
+        throw new Error(`Failed to start upload session: ${initRes.status} ${text}`);
+      }
 
-      res.json(response.data);
+      const uploadUrl = initRes.headers.get("Location");
+      if (!uploadUrl) throw new Error("Drive didn't return an upload session URL");
+
+      res.json({ uploadUrl });
     } catch (error: any) {
-      console.error("Drive Upload (OAuth) Error:", error);
+      console.error("Drive Upload Session Error:", error);
       res.status(500).json({ error: error.message });
-    } finally {
-      if (req.file) fs.unlink(req.file.path, () => {});
     }
   });
 

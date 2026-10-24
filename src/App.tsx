@@ -820,6 +820,7 @@ const getCategoryIcon = (categoryName: string) => {
               zipLink = uploaded.webViewLink || '';
             } catch (err) {
               console.error('Order PDF generation/upload failed:', err);
+              zipLink = 'UPLOAD FAILED — see server logs';
             }
           }
 
